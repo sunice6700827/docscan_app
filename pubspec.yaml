@@ -1,0 +1,44 @@
+name: docscan_app
+description: 夸克风格拍照扫描APP——文档扫描、文字提取、表格识别、证件扫描、图像增强/裁剪/擦除。
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # 相机 / 相册
+  image_picker: ^1.1.2
+
+  # 真实本地 OCR（Tesseract，纯本地离线识别，不依赖 Google 服务，国产手机可用）
+  flutter_tesseract_ocr: ^0.4.31
+
+  # 图像处理
+  image: ^4.2.0
+  path_provider: ^2.1.4
+
+  # 分享 / 导出
+  share_plus: ^10.0.2
+
+  # 多页合并 PDF
+  pdf: ^3.11.0
+
+  # 保存文件到系统目录（下载/文件）
+  file_saver: ^0.2.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/tessdata/chi_sim.traineddata
+    - assets/tessdata/eng.traineddata
+    - assets/tessdata_config.json
