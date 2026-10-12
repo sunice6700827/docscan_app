@@ -96,9 +96,9 @@ class _TableRecognizePageState extends State<TableRecognizePage> {
       out = ImageService.enhance(
         out,
         brightness: 0.02,
-        contrast: 1.06,
+        contrast: 1.15,
         saturation: 0.95,
-        sharpen: 0.3,
+        sharpen: 0.5,
       );
       return await ImageService.savePng(out, name: 'enhanced');
     } catch (_) {

@@ -85,7 +85,7 @@ class ImageService {
   static img.Image perspectiveCorrect(
     img.Image src,
     List<Offset> corners, {
-    double outWidth = 900,
+    double outWidth = 2000,
     double? outHeight,
     bool forceA4 = false,
   }) {
