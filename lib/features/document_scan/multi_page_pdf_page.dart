@@ -33,10 +33,10 @@ class _MultiPagePdfPageState extends State<MultiPagePdfPage> {
       }
       out = ImageService.enhance(
         out,
-        brightness: 0.05,
-        contrast: 1.28,
-        saturation: 0.9,
-        sharpen: 0.4,
+        brightness: 0.03,
+        contrast: 1.12,
+        saturation: 0.95,
+        sharpen: 0.3,
       );
       return await ImageService.savePng(out, name: 'page');
     } catch (_) {

@@ -1,12 +1,12 @@
 import 'dart:typed_data';
-import 'dart:ui' show Offset, Size, Rect, Matrix4;
+import 'dart:ui' show Offset, Size, Rect;
 
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
 import '../../services/image_service.dart';
 
-/// 透视裁切页：拖动四角框住要裁切的区域（支持双指缩放/拖动），确认后透视拉正并裁掉周围背景
+/// 透视裁切页：整张图完整适配屏幕，拖动四角框住要裁切的区域（支持双指缩放），确认后透视拉正并裁掉周围背景
 class CropPage extends StatefulWidget {
   const CropPage({super.key, required this.initial});
   final img.Image initial;
@@ -20,9 +20,9 @@ class _CropPageState extends State<CropPage> {
   late final Uint8List _bytes = img.encodePng(_image);
   late final Size _imageSize = Size(_image.width.toDouble(), _image.height.toDouble());
 
+  Rect? _imgRect;
   List<Offset>? _corners;
   final TransformationController _transform = TransformationController();
-  bool _initDone = false;
 
   static const _cornerColor = Color(0xFF2F6BFF);
 
@@ -32,27 +32,30 @@ class _CropPageState extends State<CropPage> {
     super.dispose();
   }
 
-  void _initTransform(Size viewport) {
-    if (_initDone) return;
-    _initDone = true;
-    final scaleX = viewport.width / _imageSize.width;
-    final scaleY = viewport.height / _imageSize.height;
-    final scale = scaleX < scaleY ? scaleX : scaleY;
-    _transform.value = Matrix4.identity()
-      ..translate(viewport.width / 2, viewport.height / 2)
-      ..scale(scale)
-      ..translate(-_imageSize.width / 2, -_imageSize.height / 2);
+  Rect _containRect(Size box) {
+    final scale = (box.width / _imageSize.width) < (box.height / _imageSize.height)
+        ? box.width / _imageSize.width
+        : box.height / _imageSize.height;
+    final w = _imageSize.width * scale;
+    final h = _imageSize.height * scale;
+    return Rect.fromLTWH((box.width - w) / 2, (box.height - h) / 2, w, h);
   }
 
   void _confirm() {
+    final r = _imgRect;
     final c = _corners;
-    if (c == null || _quadArea(c) < _imageSize.width * _imageSize.height * 0.03) {
+    if (r == null || c == null || _quadArea(c) < r.width * r.height * 0.03) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('请拖动四个角点框住要裁切的区域')),
       );
       return;
     }
-    final cropped = ImageService.perspectiveCorrect(_image, c);
+    // 视口坐标 → 图片像素坐标
+    final scale = r.width / _imageSize.width;
+    final px = c
+        .map((p) => Offset((p.dx - r.left) / scale, (p.dy - r.top) / scale))
+        .toList();
+    final cropped = ImageService.perspectiveCorrect(_image, px);
     Navigator.of(context).pop(cropped);
   }
 
@@ -86,61 +89,59 @@ class _CropPageState extends State<CropPage> {
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final viewport = Size(constraints.maxWidth, constraints.maxHeight);
-                _initTransform(viewport);
+                final imgRect = _containRect(viewport);
+                _imgRect = imgRect;
                 final corners = _corners ??
                     (() {
                       final c = [
-                        Offset.zero,
-                        Offset(_imageSize.width, 0),
-                        Offset(_imageSize.width, _imageSize.height),
-                        Offset(0, _imageSize.height),
+                        imgRect.topLeft,
+                        imgRect.topRight,
+                        imgRect.bottomRight,
+                        imgRect.bottomLeft,
                       ];
                       WidgetsBinding.instance.addPostFrameCallback((_) {
                         if (mounted) setState(() => _corners = c);
                       });
                       return c;
                     })();
-                return Stack(
-                  children: [
-                    Positioned.fill(
-                      child: InteractiveViewer(
-                        transformationController: _transform,
-                        constrained: false,
-                        minScale: 0.05,
-                        maxScale: 8,
-                        boundaryMargin: const EdgeInsets.all(200),
-                        child: SizedBox(
-                          width: _imageSize.width,
-                          height: _imageSize.height,
-                          child: Stack(
-                            clipBehavior: Clip.none,
-                            children: [
-                              Positioned.fill(
-                                child: Image.memory(_bytes, fit: BoxFit.fill, gaplessPlayback: true),
-                              ),
-                              CustomPaint(painter: _CornerPainter(corners, _cornerColor)),
-                              for (var i = 0; i < 4; i++)
-                                _CornerHandle(
-                                  position: corners[i],
-                                  color: _cornerColor,
-                                  onDrag: (delta) {
-                                    final s = _transform.value.getMaxScaleOnAxis();
-                                    setState(() {
-                                      final c = [...corners];
-                                      c[i] = Offset(
-                                        (c[i].dx + delta.dx / s).clamp(0.0, _imageSize.width),
-                                        (c[i].dy + delta.dy / s).clamp(0.0, _imageSize.height),
-                                      );
-                                      _corners = c;
-                                    });
-                                  },
-                                ),
-                            ],
-                          ),
+                return InteractiveViewer(
+                  transformationController: _transform,
+                  constrained: false,
+                  minScale: 0.3,
+                  maxScale: 6,
+                  boundaryMargin: const EdgeInsets.all(80),
+                  child: SizedBox(
+                    width: viewport.width,
+                    height: viewport.height,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned.fromRect(
+                          rect: imgRect,
+                          child: Image.memory(_bytes, fit: BoxFit.fill, gaplessPlayback: true),
                         ),
-                      ),
+                        Positioned.fill(
+                          child: CustomPaint(painter: _CornerPainter(corners, _cornerColor)),
+                        ),
+                        for (var i = 0; i < 4; i++)
+                          _CornerHandle(
+                            position: corners[i],
+                            color: _cornerColor,
+                            onDrag: (delta) {
+                              final s = _transform.value.getMaxScaleOnAxis();
+                              setState(() {
+                                final c = [...corners];
+                                c[i] = Offset(
+                                  (c[i].dx + delta.dx / s).clamp(0.0, viewport.width),
+                                  (c[i].dy + delta.dy / s).clamp(0.0, viewport.height),
+                                );
+                                _corners = c;
+                              });
+                            },
+                          ),
+                      ],
                     ),
-                  ],
+                  ),
                 );
               },
             ),
