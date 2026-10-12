@@ -95,8 +95,8 @@ class _TableRecognizePageState extends State<TableRecognizePage> {
       }
       out = ImageService.enhance(
         out,
-        brightness: 0.03,
-        contrast: 1.12,
+        brightness: 0.02,
+        contrast: 1.06,
         saturation: 0.95,
         sharpen: 0.3,
       );

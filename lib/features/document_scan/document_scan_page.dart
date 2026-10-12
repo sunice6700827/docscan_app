@@ -18,6 +18,18 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
   File? _imageFile;
   bool _busy = false;
   OcrLanguage _language = OcrLanguage.chinese;
+  List<File> _history = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+  }
+
+  Future<void> _loadHistory() async {
+    final h = await ImageService.listHistory();
+    if (mounted) setState(() => _history = h);
+  }
 
   /// 拍照/选图后自动处理：检测纸张边缘透视校正 + 轻度增强（像夸克拍完自动校正好）
   Future<File> _autoProcess(File file) async {
@@ -30,8 +42,8 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
       }
       out = ImageService.enhance(
         out,
-        brightness: 0.03,
-        contrast: 1.12,
+        brightness: 0.02,
+        contrast: 1.06,
         saturation: 0.95,
         sharpen: 0.3,
       );
@@ -48,6 +60,16 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
     if (!mounted) return;
     setState(() {
       _imageFile = processed;
+      _language = OcrLanguage.chinese;
+    });
+    // 自动存入历史，返回后还能找到
+    await ImageService.saveToHistory(ImageService.decode(processed));
+    await _loadHistory();
+  }
+
+  void _openHistory(File f) {
+    setState(() {
+      _imageFile = f;
       _language = OcrLanguage.chinese;
     });
   }
@@ -109,50 +131,91 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
   }
 
   Widget _buildEmpty() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
+    return ListView(
+      padding: const EdgeInsets.all(20),
+      children: [
+        if (_history.isNotEmpty) ...[
+          Row(
+            children: [
+              const Text('最近扫描', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.delete_outline, size: 20),
+                tooltip: '清空历史',
+                onPressed: _clearHistory,
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 110,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: _history.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 10),
+              itemBuilder: (context, i) {
+                final f = _history[i];
+                return GestureDetector(
+                  onTap: () => _openHistory(f),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: Image.file(f, width: 84, height: 110, fit: BoxFit.cover),
+                  ),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 24),
+        ],
+        const SizedBox(height: 40),
+        Container(
+          width: 88,
+          height: 88,
+          margin: const EdgeInsets.only(bottom: 20),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: const Color(0xFF2F6BFF).withOpacity(0.1),
+            shape: BoxShape.circle,
+          ),
+          child: const Icon(Icons.document_scanner_outlined,
+              color: Color(0xFF2F6BFF), size: 44),
+        ),
+        const Text('拍摄或选择一张文档图片',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        const Text('支持中文/英文识别，文字在本地识别，不上传服务器\n扫描结果会自动保存，返回后可在“最近扫描”找到',
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 13, color: Color(0xFF8A9099))),
+        const SizedBox(height: 28),
+        Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              width: 88,
-              height: 88,
-              decoration: BoxDecoration(
-                color: const Color(0xFF2F6BFF).withOpacity(0.1),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(Icons.document_scanner_outlined,
-                  color: Color(0xFF2F6BFF), size: 44),
+            _ActionButton(
+              icon: Icons.photo_camera_outlined,
+              label: '拍照',
+              onTap: () => _pick(camera: true),
             ),
-            const SizedBox(height: 20),
-            const Text('拍摄或选择一张文档图片',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            const Text('支持中文/英文识别，文字在本地识别，不上传服务器',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 13, color: Color(0xFF8A9099))),
-            const SizedBox(height: 28),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                _ActionButton(
-                  icon: Icons.photo_camera_outlined,
-                  label: '拍照',
-                  onTap: () => _pick(camera: true),
-                ),
-                const SizedBox(width: 16),
-                _ActionButton(
-                  icon: Icons.photo_library_outlined,
-                  label: '相册',
-                  onTap: () => _pick(camera: false),
-                ),
-              ],
+            const SizedBox(width: 16),
+            _ActionButton(
+              icon: Icons.photo_library_outlined,
+              label: '相册',
+              onTap: () => _pick(camera: false),
             ),
           ],
         ),
-      ),
+      ],
     );
+  }
+
+  Future<void> _clearHistory() async {
+    final dir = await ImageService.scanHistoryDir();
+    for (final f in dir.listSync().whereType<File>()) {
+      try {
+        f.deleteSync();
+      } catch (_) {}
+    }
+    await _loadHistory();
   }
 
   Widget _buildPreview() {

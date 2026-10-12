@@ -27,6 +27,35 @@ class ImageService {
     return file;
   }
 
+  // ---------------------------------------------------------------------------
+  // 扫描历史：处理后的结果保存到应用文档目录，重新进入可查看/重新识别
+  // ---------------------------------------------------------------------------
+  static Future<Directory> scanHistoryDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/scan_history');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return dir;
+  }
+
+  static Future<File> saveToHistory(img.Image image) async {
+    final dir = await scanHistoryDir();
+    final file = File('${dir.path}/${DateTime.now().millisecondsSinceEpoch}.png');
+    await file.writeAsBytes(img.encodePng(image));
+    return file;
+  }
+
+  static Future<List<File>> listHistory() async {
+    final dir = await scanHistoryDir();
+    if (!dir.existsSync()) return [];
+    final files = dir
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.png'))
+        .toList()
+      ..sort((a, b) => b.path.compareTo(a.path)); // 最新在前
+    return files;
+  }
+
   /// 按 UI 比例缩小显示用缩略图（限制最长边）
   static img.Image thumb(img.Image src, {int maxSide = 1600}) {
     if (src.width <= maxSide && src.height <= maxSide) return src;
@@ -52,15 +81,27 @@ class ImageService {
   // 透视校正：将四个角点围成的四边形矫正为正视矩形（证件/文档扫描）
   // ---------------------------------------------------------------------------
   /// corners 顺序：左上、右上、右下、左下（图片像素坐标）
+  /// forceA4=true 时输出为 A4 纸张比例（自动按四边形方向选竖版/横版），更适合文档
   static img.Image perspectiveCorrect(
     img.Image src,
     List<Offset> corners, {
     double outWidth = 900,
     double? outHeight,
+    bool forceA4 = false,
   }) {
     assert(corners.length == 4, '需要恰好 4 个角点');
     final tl = corners[0], tr = corners[1], br = corners[2], bl = corners[3];
-    final h = outHeight ?? ((outWidth / _quadWidth(tl, tr, br, bl)) * _quadHeight(tl, tr, br, bl)).roundToDouble();
+    final quadW = _quadWidth(tl, tr, br, bl);
+    final quadH = _quadHeight(tl, tr, br, bl);
+    double h;
+    if (outHeight != null) {
+      h = outHeight;
+    } else if (forceA4) {
+      final aspect = quadW >= quadH ? 1.41429 : 0.70707; // 横A4 / 竖A4
+      h = outWidth / aspect;
+    } else {
+      h = (outWidth / quadW) * quadH;
+    }
 
     final H = _homographyDstToSrc(
       outW: outWidth,
