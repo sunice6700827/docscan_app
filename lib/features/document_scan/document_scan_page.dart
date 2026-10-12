@@ -31,9 +31,9 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
       out = ImageService.enhance(
         out,
         brightness: 0.05,
-        contrast: 1.08,
-        saturation: 1.02,
-        sharpen: 0.3,
+        contrast: 1.28,
+        saturation: 0.9,
+        sharpen: 0.4,
       );
       return await ImageService.savePng(out, name: 'enhanced');
     } catch (_) {
@@ -163,11 +163,14 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
             padding: const EdgeInsets.all(16),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(16),
-              child: Image.file(
-                _imageFile!,
-                fit: BoxFit.contain,
-                width: double.infinity,
-                height: double.infinity,
+              child: Container(
+                color: Colors.white,
+                child: Image.file(
+                  _imageFile!,
+                  fit: BoxFit.contain,
+                  width: double.infinity,
+                  height: double.infinity,
+                ),
               ),
             ),
           ),

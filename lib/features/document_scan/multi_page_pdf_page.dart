@@ -22,14 +22,23 @@ class _MultiPagePdfPageState extends State<MultiPagePdfPage> {
   final List<File> _pages = [];
   bool _busy = false;
 
-  /// 拍摄/选图后自动透视校正：检测到可靠文档四角则矫正，否则保留原图
+  /// 拍摄/选图后自动透视校正 + 增强：检测到可靠文档四角则矫正并提亮增强，否则保留原图
   Future<File> _autoCorrect(File file) async {
     try {
       final decoded = ImageService.decode(file);
+      var out = decoded;
       final corners = ImageService.detectDocumentCorners(decoded);
-      if (corners == null) return file;
-      final corrected = ImageService.perspectiveCorrect(decoded, corners);
-      return await ImageService.savePng(corrected, name: 'page');
+      if (corners != null) {
+        out = ImageService.perspectiveCorrect(decoded, corners);
+      }
+      out = ImageService.enhance(
+        out,
+        brightness: 0.05,
+        contrast: 1.28,
+        saturation: 0.9,
+        sharpen: 0.4,
+      );
+      return await ImageService.savePng(out, name: 'page');
     } catch (_) {
       return file;
     }
