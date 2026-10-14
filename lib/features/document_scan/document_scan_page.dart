@@ -42,7 +42,7 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
         out = ImageService.perspectiveCorrect(src, corners);
       }
       // 自适应曝光归一化：无论四角是否检出都执行，把纸面亮度稳定拉到固定白点，
-      // 从根上消除"有时过曝发白、有时欠曝发灰、效果不稳定"。再补一点边缘锐化。
+      // 消除"有时过曝发白、有时欠曝发灰"以及检出/未检出两条路径的明暗跳变。
       out = ImageService.normalizeForScan(out);
       out = ImageService.enhance(out, sharpen: 0.35);
       return await ImageService.savePng(out, name: 'enhanced');
