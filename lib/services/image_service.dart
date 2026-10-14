@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset, Rect;
 
@@ -9,14 +10,18 @@ import 'package:path_provider/path_provider.dart';
 ///
 /// 全部在本地完成，不联网。
 class ImageService {
-  /// 解码图片文件
+  /// 解码图片文件。
+  ///
+  /// 必须应用 EXIF 方向：手机竖拍的照片像素常以"横躺 + orientation 标记"
+  /// 保存，image 包解码不会自动转正。不处理的话，后续四角检测、透视矫正、
+  /// PDF 合成全部基于横躺像素，导致结果歪斜、被裁切、方向错乱。
   static img.Image decode(File file) {
     final bytes = file.readAsBytesSync();
     final decoded = img.decodeImage(bytes);
     if (decoded == null) {
       throw Exception('无法解码图片，格式可能不支持');
     }
-    return decoded;
+    return img.bakeOrientation(decoded);
   }
 
   /// 编码并保存到应用临时目录，返回文件路径
@@ -343,13 +348,14 @@ class ImageService {
   // ---------------------------------------------------------------------------
   static img.Image normalizeForScan(
     img.Image src, {
-    double targetWhite = 240,
-    double targetInk = 22,
+    double targetWhite = 245,
+    double targetInk = 30,
     int tiles = 12,
-    double globalWeight = 0.55, // 分块统计向全局统计靠拢的比例（抗噪声）
-    double minRange = 28, // 黑白场最小跨度，防止增益爆炸把噪点拉成脏斑
-    double minScale = 0.70,
+    double globalWeight = 0.5, // 分块统计向全局统计靠拢的比例（抗噪声）
+    double minRange = 18, // 黑白场最小跨度，防止增益爆炸把噪点拉成脏斑
+    double minScale = 0.8,
     double maxScale = 3.0,
+    double gamma = 1.25, // 中间调压暗：灰字/阴影变黑，纸面(>92%)不动
   }) {
     final w = src.width, h = src.height;
     final buf = _toRgb(src);
@@ -380,12 +386,12 @@ class ImageService {
         }
         var total = (x1 - x0) * (y1 - y0);
         if (total < 1) total = 1;
-        white[ix][iy] = _scanPercentile(hist, total, 0.92);
-        black[ix][iy] = _scanPercentile(hist, total, 0.06);
+        white[ix][iy] = _scanPercentile(hist, total, 0.95);
+        black[ix][iy] = _scanPercentile(hist, total, 0.02);
       }
     }
-    final gWhite = _scanPercentile(globalHist, sw * sh, 0.92);
-    final gBlack = _scanPercentile(globalHist, sw * sh, 0.06);
+    final gWhite = _scanPercentile(globalHist, sw * sh, 0.95);
+    final gBlack = _scanPercentile(globalHist, sw * sh, 0.02);
 
     // 全页黑白场跨度太小（空白纸/无文字画面）：不做自动色阶，原样返回，
     // 否则会把噪声当字迹拉伸，整页拉暗或拉脏。
@@ -408,14 +414,16 @@ class ImageService {
     final wSm = _smoothTiles(vals: white, tiles: tiles);
     final bSm = _smoothTiles(vals: black, tiles: tiles);
 
-    // 3) 纸面白平衡（灰世界，增益限幅 ±12%），消除灯光偏色
+    // 3) 纸面白平衡（灰世界，增益限幅 ±50%）：纸面=亮度高于全图 p65 的像素。
+    // 深色桌面/手机阴影会把均值拉偏，p65 分位判定比固定阈值稳健；
+    // 蓝桌布反光这类强偏色需要大修正量，限幅从 ±12% 放宽到 ±50%。
     var pr = 0.0, pg = 0.0, pb = 0.0, pn = 0;
-    final whiteTh = gWhite * 0.85;
+    final paperTh = _scanPercentile(globalHist, sw * sh, 0.65);
     for (var y = 0; y < sh; y++) {
       for (var x = 0; x < sw; x++) {
         final i = (y * sw + x) * 3;
         final lv = sb[i] * 0.299 + sb[i + 1] * 0.587 + sb[i + 2] * 0.114;
-        if (lv >= whiteTh) {
+        if (lv >= paperTh) {
           pr += sb[i];
           pg += sb[i + 1];
           pb += sb[i + 2];
@@ -429,12 +437,18 @@ class ImageService {
       pg /= pn;
       pb /= pn;
       final gray = (pr + pg + pb) / 3;
-      wr = (gray / pr).clamp(0.88, 1.12);
-      wg = (gray / pg).clamp(0.88, 1.12);
-      wb = (gray / pb).clamp(0.88, 1.12);
+      wr = (gray / pr).clamp(0.5, 1.5);
+      wg = (gray / pg).clamp(0.5, 1.5);
+      wb = (gray / pb).clamp(0.5, 1.5);
     }
 
-    // 4) 逐像素：双线性插值取本处（黑场,白场）→ 线性映射到目标区间
+    // 4) 逐像素：双线性插值取本处（黑场,白场）→ 线性映射到目标区间 → 中间调压暗
+    // gamma 曲线只作用于 0~92% 区间：纸面（映射后接近 targetWhite）保持不动，
+    // 灰字迹、纸面阴影被压黑，解决"字迹变淡、阴影发灰"。
+    final gammaLut = List<double>.generate(1025, (k) {
+      final n = k / 1024.0;
+      return n > 0.92 ? n : _pow(n, gamma);
+    });
     final out = img.Image(width: w, height: h);
     final tilesLast = (tiles - 1).toDouble();
     for (var y = 0; y < h; y++) {
@@ -469,6 +483,11 @@ class ImageService {
         var lOut = (l - bv) * scale + targetInk;
         if (lOut < 0) lOut = 0;
         if (lOut > 255) lOut = 255;
+        // 查表应用 gamma（1024 级精度，避免逐像素 pow）
+        var gi = (lOut * 4.0).round();
+        if (gi < 0) gi = 0;
+        if (gi > 1024) gi = 1024;
+        lOut = gammaLut[gi] * 255.0;
         final f = l > 4.0 ? lOut / l : 1.0;
         final nr = (r0 * wr * f).round();
         final ng = (g0 * wg * f).round();
@@ -482,6 +501,12 @@ class ImageService {
       }
     }
     return out;
+  }
+
+  /// 幂函数（base<=0 时返回 0，避免 NaN）
+  static double _pow(double base, double exp) {
+    if (base <= 0) return 0;
+    return math.pow(base, exp).toDouble();
   }
 
   /// 3x3 均值平滑分块参数图，消除块间可见接缝
@@ -654,9 +679,29 @@ class ImageService {
     final ordered = _orderCorners(quad);
     if (_quadArea(ordered) < sw * sh * 0.06) return null;
 
-    // 8) 放大回原图坐标
+    // 8) 可靠性校验：特写照片里纸张常超出画面，凸包角点会贴在图像边界上，
+    // 此时"检出的四边形"其实是画面本身，拿它做透视矫正会把边缘文字裁掉。
+    // 判定不可靠返回 null，流程自动跳过矫正、只做曝光归一化（歪斜交给手动四角）。
+    if (!_quadReliable(ordered, sw, sh)) return null;
+
+    // 9) 放大回原图坐标
     final scaleX = src.width / sw, scaleY = src.height / sh;
     return ordered.map((p) => Offset(p.dx * scaleX, p.dy * scaleY)).toList();
+  }
+
+  /// 四边形角点可靠性：≥2 个角贴着图像边界，或四边形几乎覆盖整幅画面，
+  /// 都说明纸张出框、检测的是画面框而非纸张，不可信。
+  static bool _quadReliable(List<Offset> ordered, int w, int h) {
+    final marginX = w * 0.02, marginY = h * 0.02;
+    var edgeCorners = 0;
+    for (final p in ordered) {
+      if (p.dx <= marginX || p.dx >= w - marginX || p.dy <= marginY || p.dy >= h - marginY) {
+        edgeCorners++;
+      }
+    }
+    if (edgeCorners >= 2) return false;
+    if (_quadArea(ordered) > w * h * 0.92) return false;
+    return true;
   }
 
   /// 最大连通亮区域（BFS），返回亮像素点列表
