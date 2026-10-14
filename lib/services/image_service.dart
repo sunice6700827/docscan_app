@@ -429,55 +429,162 @@ class ImageService {
       p.setRgb(g, g, g);
     }
 
-    // 2) Otsu 阈值二值化（文档偏亮、背景偏暗）
+    // 2) Otsu 阈值二值化
     final threshold = _otsuThreshold(gray);
-    // 3) 收集亮像素（文档区域）
-    final pts = <(int, int)>[];
+    final bin = List.generate(sh, (_) => List<int>.filled(sw, 0));
     for (var y = 0; y < sh; y++) {
       for (var x = 0; x < sw; x++) {
-        if (gray.getPixel(x, y).r > threshold) pts.add((x, y));
+        bin[y][x] = gray.getPixel(x, y).r > threshold ? 1 : 0;
       }
     }
-    if (pts.length < sw * sh * 0.02) return null;
 
-    // 4) 质心
-    var cx = 0.0, cy = 0.0;
-    for (final (x, y) in pts) {
-      cx += x; cy += y;
-    }
-    cx /= pts.length; cy /= pts.length;
+    // 3) 提取最大的连通亮区域（纸张本体），剔除背景噪声干扰
+    final region = _largestBrightRegion(bin, sw, sh);
+    if (region.length < sw * sh * 0.02) return null;
 
-    // 5) 相对质心按四象限取最远点，得到 4 个候选角
-    final candidates = <Offset>[];
-    for (var q = 0; q < 4; q++) {
-      var best = const Offset(-1, -1);
-      var bestD = -1.0;
-      final lo = q * 90.0 * 0.0174533, hi = (q + 1) * 90.0 * 0.0174533;
-      for (final (x, y) in pts) {
-        final a = _angle(Offset(x.toDouble(), y.toDouble()), Offset(cx, cy));
-        if (a < lo || a >= hi) continue;
-        final d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-        if (d > bestD) {
-          bestD = d;
-          best = Offset(x.toDouble(), y.toDouble());
-        }
-      }
-      if (best.dx < 0) return null;
-      candidates.add(best);
-    }
+    // 4) 求凸包
+    final hull = _convexHull(region);
+    if (hull.length < 4) return null;
 
-    // 6) 校验：四边形面积应占一定比例
-    final ordered = _orderCorners(candidates);
+    // 5) 多边形近似（RDP），压出真正的纸张角点
+    final eps = _perimeter(hull) * 0.02;
+    final approx = _rdp(hull, eps);
+
+    // 6) 取面积最大的 4 角四边形
+    final quad = _bestQuad(approx);
+    if (quad == null) return null;
+
+    // 7) 排序 + 面积校验
+    final ordered = _orderCorners(quad);
     if (_quadArea(ordered) < sw * sh * 0.06) return null;
 
-    // 7) 放大回原图坐标
+    // 8) 放大回原图坐标
     final scaleX = src.width / sw, scaleY = src.height / sh;
     return ordered.map((p) => Offset(p.dx * scaleX, p.dy * scaleY)).toList();
   }
 
-  static double _angle(Offset p, Offset c) {
-    final a = (p - c).direction;
-    return a < 0 ? a + 6.283185 : a;
+  /// 最大连通亮区域（BFS），返回亮像素点列表
+  static List<Offset> _largestBrightRegion(List<List<int>> bin, int w, int h) {
+    final visited = List.generate(h, (_) => List<bool>.filled(w, false));
+    var best = <Offset>[];
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (bin[y][x] == 1 && !visited[y][x]) {
+          final stack = <(int, int)>[(x, y)];
+          visited[y][x] = true;
+          final comp = <Offset>[];
+          while (stack.isNotEmpty) {
+            final (cx, cy) = stack.removeLast();
+            comp.add(Offset(cx.toDouble(), cy.toDouble()));
+            for (final (nx, ny) in _neighbors8(cx, cy, w, h)) {
+              if (!visited[ny][nx] && bin[ny][nx] == 1) {
+                visited[ny][nx] = true;
+                stack.add((nx, ny));
+              }
+            }
+          }
+          if (comp.length > best.length) best = comp;
+        }
+      }
+    }
+    return best;
+  }
+
+  /// Andrew 单调链凸包
+  static List<Offset> _convexHull(List<Offset> pts) {
+    if (pts.length < 3) return pts;
+    final p = [...pts]
+      ..sort((a, b) => a.dx != b.dx ? a.dx.compareTo(b.dx) : a.dy.compareTo(b.dy));
+    List<Offset> build(List<Offset> seq) {
+      final h = <Offset>[];
+      for (final o in seq) {
+        while (h.length >= 2) {
+          final a = h[h.length - 2], b = h[h.length - 1];
+          final cross =
+              (b.dx - a.dx) * (o.dy - a.dy) - (b.dy - a.dy) * (o.dx - a.dx);
+          if (cross <= 0) {
+            h.removeLast();
+          } else {
+            break;
+          }
+        }
+        h.add(o);
+      }
+      return h;
+    }
+    final lower = build(p);
+    final upper = build(p.reversed.toList());
+    lower.removeLast();
+    upper.removeLast();
+    return [...lower, ...upper];
+  }
+
+  /// 多边形周长
+  static double _perimeter(List<Offset> pts) {
+    var sum = 0.0;
+    for (var i = 0; i < pts.length; i++) {
+      sum += (pts[(i + 1) % pts.length] - pts[i]).distance;
+    }
+    return sum;
+  }
+
+  /// Ramer–Douglas–Peucker 多边形简化
+  static List<Offset> _rdp(List<Offset> pts, double eps) {
+    if (pts.length <= 2) return pts;
+    var dmax = 0.0, index = 0;
+    final n = pts.length;
+    for (var i = 1; i < n - 1; i++) {
+      final d = _perpDistSq(pts[i], pts[0], pts[n - 1]);
+      if (d > dmax) {
+        index = i;
+        dmax = d;
+      }
+    }
+    if (dmax > eps * eps) {
+      final left = _rdp(pts.sublist(0, index + 1), eps);
+      final right = _rdp(pts.sublist(index), eps);
+      return [...left.sublist(0, left.length - 1), ...right];
+    }
+    return [pts.first, pts.last];
+  }
+
+  static double _perpDistSq(Offset p, Offset a, Offset b) {
+    final dx = b.dx - a.dx, dy = b.dy - a.dy;
+    final lenSq = dx * dx + dy * dy;
+    if (lenSq == 0) {
+      final qx = p.dx - a.dx, qy = p.dy - a.dy;
+      return qx * qx + qy * qy;
+    }
+    final t = ((p.dx - a.dx) * dx + (p.dy - a.dy) * dy) / lenSq;
+    final tc = t.clamp(0.0, 1.0).toDouble();
+    final qx = a.dx + tc * dx, qy = a.dy + tc * dy;
+    final ux = p.dx - qx, uy = p.dy - qy;
+    return ux * ux + uy * uy;
+  }
+
+  /// 从近似顶点中取面积最大的 4 角四边形
+  static List<Offset>? _bestQuad(List<Offset> pts) {
+    if (pts.length < 4) return null;
+    if (pts.length == 4) return pts;
+    List<Offset>? best;
+    var bestArea = -1.0;
+    void comb(int start, List<Offset> cur) {
+      if (cur.length == 4) {
+        final a = _quadArea(cur);
+        if (a > bestArea) {
+          bestArea = a;
+          best = List.of(cur);
+        }
+        return;
+      }
+      for (var i = start; i < pts.length; i++) {
+        cur.add(pts[i]);
+        comb(i + 1, cur);
+        cur.removeLast();
+      }
+    }
+    comb(0, []);
+    return best;
   }
 
   /// 排序为 左上、右上、右下、左下
