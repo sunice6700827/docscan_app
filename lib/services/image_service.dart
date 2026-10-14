@@ -295,36 +295,239 @@ class ImageService {
     return out;
   }
 
+  /// 非锐化掩蔽（unsharp mask）。
+  ///
+  /// 关键约束：卷积系数之和必须为 1，这样**平坦区域输出恒等于输入**，
+  /// 只增强边缘，不会整体抬高画面亮度。
+  ///
+  /// 旧实现的核为 [[0,-1,0],[-1,5,0],[0,0,0]]，系数之和是 3，
+  /// 在纸面这类平坦区域卷积结果恒等于 3v，最终输出变成 v*(1+2*amount)
+  /// （amount=0.5 时相当于亮度翻倍），纸面被推到 255 纯白、文字被抬成灰，
+  /// 这就是"曝光过高、字迹发虚"的根源之一。
   static img.Image _sharpen(img.Image src, double amount) {
-    const kernel = <List<double>>[
-      [0, -1, 0],
-      [-1, 5, 0],
-      [0, 0, 0],
-    ];
     final buf = _toRgb(src);
     final w = src.width, h = src.height;
     final out = img.Image.from(src);
+    final a = amount.clamp(0.0, 1.0); // 上限 1.0，避免振铃与噪点放大
     for (var y = 0; y < h; y++) {
       for (var x = 0; x < w; x++) {
-        var r = 0.0, g = 0.0, b = 0.0;
-        for (var ky = 0; ky < 3; ky++) {
-          for (var kx = 0; kx < 3; kx++) {
-            final px = (x + kx - 1).clamp(0, w - 1);
-            final py = (y + ky - 1).clamp(0, h - 1);
-            final k = kernel[ky][kx];
-            final i = (py * w + px) * 3;
-            r += buf[i] * k; g += buf[i + 1] * k; b += buf[i + 2] * k;
+        final i = (y * w + x) * 3;
+        final cr = buf[i], cg = buf[i + 1], cb = buf[i + 2];
+        // 8 邻域均值（不含自身）作为局部低频估计
+        var lr = 0.0, lg = 0.0, lb = 0.0;
+        for (var ky = -1; ky <= 1; ky++) {
+          for (var kx = -1; kx <= 1; kx++) {
+            if (kx == 0 && ky == 0) continue;
+            final px = (x + kx).clamp(0, w - 1);
+            final py = (y + ky).clamp(0, h - 1);
+            final j = (py * w + px) * 3;
+            lr += buf[j]; lg += buf[j + 1]; lb += buf[j + 2];
           }
         }
-        final i = (y * w + x) * 3;
-        final p0r = buf[i], p0g = buf[i + 1], p0b = buf[i + 2];
-        final nr = p0r + (r - p0r) * amount;
-        final ng = p0g + (g - p0g) * amount;
-        final nb = p0b + (b - p0b) * amount;
-        out.setPixelRgb(x, y, nr.round().clamp(0, 255), ng.round().clamp(0, 255), nb.round().clamp(0, 255));
+        lr /= 8.0; lg /= 8.0; lb /= 8.0;
+        out.setPixelRgb(
+          x, y,
+          (cr + (cr - lr) * a).round().clamp(0, 255),
+          (cg + (cg - lg) * a).round().clamp(0, 255),
+          (cb + (cb - lb) * a).round().clamp(0, 255),
+        );
       }
     }
     return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 自适应曝光归一化（扫描文档专用）
+  //
+  // 用于解决「同一 App 有时过曝发白、有时欠曝发灰、效果不稳定」：
+  // 旧流程套用写死的 brightness/contrast 预设，只适配一种光线；拍照时光线
+  // 千变万化（正常室内/阴影/逆光/闪光灯），固定预设必然在暗光欠曝、强光过曝。
+  //
+  // 新算法：把画面分块，逐块统计纸面亮度（白场）与字迹亮度（黑场），块间平滑
+  // 并与全局统计融合；每块把纸面线性映射到固定目标白点，字迹映射到黑点。
+  // 于是无论整页偏亮偏暗，输出纸面亮度都稳定落在同一水平；分块统计还能同时
+  // 压平一侧阴影、逆光渐变这类页内光照不均。
+  // ---------------------------------------------------------------------------
+  static img.Image normalizeForScan(
+    img.Image src, {
+    double targetWhite = 240,
+    double targetInk = 22,
+    int tiles = 12,
+    double globalWeight = 0.55, // 分块统计向全局统计靠拢的比例（抗噪声）
+    double minRange = 28, // 黑白场最小跨度，防止增益爆炸把噪点拉成脏斑
+    double minScale = 0.70,
+    double maxScale = 3.0,
+  }) {
+    final w = src.width, h = src.height;
+    final buf = _toRgb(src);
+
+    // 1) 在缩图上做分块直方图统计（快），得到的参数作用于全分辨率
+    final small = thumb(src, maxSide: 480);
+    final sb = _toRgb(small);
+    final sw = small.width, sh = small.height;
+    final white = List.generate(tiles, (_) => List<double>.filled(tiles, 220));
+    final black = List.generate(tiles, (_) => List<double>.filled(tiles, 40));
+    final globalHist = List<int>.filled(256, 0);
+    for (var ix = 0; ix < tiles; ix++) {
+      final x0 = (ix * sw ~/ tiles);
+      final x1 = (((ix + 1) * sw) ~/ tiles);
+      for (var iy = 0; iy < tiles; iy++) {
+        final y0 = (iy * sh ~/ tiles);
+        final y1 = (((iy + 1) * sh) ~/ tiles);
+        final hist = List<int>.filled(256, 0);
+        for (var y = y0; y < y1 && y < sh; y++) {
+          for (var x = x0; x < x1 && x < sw; x++) {
+            final i = (y * sw + x) * 3;
+            final lv = (sb[i] * 0.299 + sb[i + 1] * 0.587 + sb[i + 2] * 0.114)
+                .round();
+            final v = lv < 0 ? 0 : (lv > 255 ? 255 : lv);
+            hist[v]++;
+            globalHist[v]++;
+          }
+        }
+        var total = (x1 - x0) * (y1 - y0);
+        if (total < 1) total = 1;
+        white[ix][iy] = _percentile(hist, total, 0.92);
+        black[ix][iy] = _percentile(hist, total, 0.06);
+      }
+    }
+    final gWhite = _percentile(globalHist, sw * sh, 0.92);
+    final gBlack = _percentile(globalHist, sw * sh, 0.06);
+
+    // 全页黑白场跨度太小（空白纸/无文字画面）：不做自动色阶，
+    // 否则会把噪声当字迹拉伸，整页拉暗或拉脏。原样返回。
+    if ((gWhite - gBlack) < minRange) return src;
+
+    // 2) 与全局统计融合；弱纹理块（空白纸/纯黑背景）退回全局，避免放大噪点
+    for (var ix = 0; ix < tiles; ix++) {
+      for (var iy = 0; iy < tiles; iy++) {
+        final wv = white[ix][iy] * (1 - globalWeight) + gWhite * globalWeight;
+        final bv = black[ix][iy] * (1 - globalWeight) + gBlack * globalWeight;
+        if ((wv - bv) < minRange) {
+          white[ix][iy] = gWhite;
+          black[ix][iy] = gBlack;
+        } else {
+          white[ix][iy] = wv;
+          black[ix][iy] = bv;
+        }
+      }
+    }
+    final wSm = _smoothTiles(vals: white, tiles: tiles);
+    final bSm = _smoothTiles(vals: black, tiles: tiles);
+
+    // 3) 纸面白平衡（灰世界，增益限幅 ±12%），消除灯光偏色又不至于改坏彩色照片
+    var pr = 0.0, pg = 0.0, pb = 0.0, pn = 0;
+    final whiteTh = gWhite * 0.85;
+    for (var y = 0; y < sh; y++) {
+      for (var x = 0; x < sw; x++) {
+        final i = (y * sw + x) * 3;
+        final lv = sb[i] * 0.299 + sb[i + 1] * 0.587 + sb[i + 2] * 0.114;
+        if (lv >= whiteTh) {
+          pr += sb[i];
+          pg += sb[i + 1];
+          pb += sb[i + 2];
+          pn++;
+        }
+      }
+    }
+    double wr = 1, wg = 1, wb = 1;
+    if (pn > 24 && pr > 1 && pg > 1 && pb > 1) {
+      pr /= pn;
+      pg /= pn;
+      pb /= pn;
+      final gray = (pr + pg + pb) / 3;
+      wr = (gray / pr).clamp(0.88, 1.12);
+      wg = (gray / pg).clamp(0.88, 1.12);
+      wb = (gray / pb).clamp(0.88, 1.12);
+    }
+
+    // 4) 逐像素：双线性插值取本处的（黑场,白场）→ 线性映射到目标区间
+    final out = img.Image(width: w, height: h);
+    final tilesLast = (tiles - 1).toDouble();
+    for (var y = 0; y < h; y++) {
+      var fy = (y + 0.5) * tiles / h - 0.5;
+      if (fy < 0) fy = 0;
+      if (fy > tilesLast) fy = tilesLast;
+      final j0 = fy.floor();
+      var j1 = j0 + 1;
+      if (j1 > tiles - 1) j1 = tiles - 1;
+      final ty = fy - j0;
+      for (var x = 0; x < w; x++) {
+        var fx = (x + 0.5) * tiles / w - 0.5;
+        if (fx < 0) fx = 0;
+        if (fx > tilesLast) fx = tilesLast;
+        final i0 = fx.floor();
+        var i1 = i0 + 1;
+        if (i1 > tiles - 1) i1 = tiles - 1;
+        final tx = fx - i0;
+
+        final wv = (wSm[i0][j0] * (1 - tx) + wSm[i1][j0] * tx) * (1 - ty) +
+            (wSm[i0][j1] * (1 - tx) + wSm[i1][j1] * tx) * ty;
+        final bv = (bSm[i0][j0] * (1 - tx) + bSm[i1][j0] * tx) * (1 - ty) +
+            (bSm[i0][j1] * (1 - tx) + bSm[i1][j1] * tx) * ty;
+        final rng = (wv - bv) < minRange ? minRange : (wv - bv);
+        var scale = (targetWhite - targetInk) / rng;
+        if (scale < minScale) scale = minScale;
+        if (scale > maxScale) scale = maxScale;
+
+        final i = (y * w + x) * 3;
+        final r0 = buf[i], g0 = buf[i + 1], b0 = buf[i + 2];
+        final l = r0 * 0.299 + g0 * 0.587 + b0 * 0.114;
+        var lOut = (l - bv) * scale + targetInk;
+        if (lOut < 0) lOut = 0;
+        if (lOut > 255) lOut = 255;
+        final f = l > 4.0 ? lOut / l : 1.0;
+        final nr = (r0 * wr * f).round();
+        final ng = (g0 * wg * f).round();
+        final nb = (b0 * wb * f).round();
+        out.setPixelRgb(
+          x, y,
+          nr < 0 ? 0 : (nr > 255 ? 255 : nr),
+          ng < 0 ? 0 : (ng > 255 ? 255 : ng),
+          nb < 0 ? 0 : (nb > 255 ? 255 : nb),
+        );
+      }
+    }
+    return out;
+  }
+
+  /// 3x3 均值平滑分块参数图，消除块间可见接缝（横条纹）
+  static List<List<double>> _smoothTiles({
+    required List<List<double>> vals,
+    required int tiles,
+  }) {
+    final m = List.generate(tiles, (i) => List<double>.from(vals[i]));
+    final o = List.generate(tiles, (_) => List<double>.filled(tiles, 0));
+    for (var ix = 0; ix < tiles; ix++) {
+      for (var iy = 0; iy < tiles; iy++) {
+        var s = 0.0, n = 0;
+        for (var dx = -1; dx <= 1; dx++) {
+          for (var dy = -1; dy <= 1; dy++) {
+            final a = ix + dx, b = iy + dy;
+            if (a >= 0 && a < tiles && b >= 0 && b < tiles) {
+              s += m[a][b];
+              n++;
+            }
+          }
+        }
+        o[ix][iy] = s / n;
+      }
+    }
+    return o;
+  }
+
+  /// 直方图分位数（p ∈ [0,1]），返回对应灰度值
+  static double _percentile(List<int> hist, int total, double p) {
+    if (total <= 0) return 0;
+    var want = (total * p).ceil();
+    if (want < 1) want = 1;
+    if (want > total) want = total;
+    var acc = 0;
+    for (var i = 0; i < 256; i++) {
+      acc += hist[i];
+      if (acc >= want) return i.toDouble();
+    }
+    return 255;
   }
 
   // ---------------------------------------------------------------------------
@@ -429,162 +632,55 @@ class ImageService {
       p.setRgb(g, g, g);
     }
 
-    // 2) Otsu 阈值二值化
+    // 2) Otsu 阈值二值化（文档偏亮、背景偏暗）
     final threshold = _otsuThreshold(gray);
-    final bin = List.generate(sh, (_) => List<int>.filled(sw, 0));
+    // 3) 收集亮像素（文档区域）
+    final pts = <(int, int)>[];
     for (var y = 0; y < sh; y++) {
       for (var x = 0; x < sw; x++) {
-        bin[y][x] = gray.getPixel(x, y).r > threshold ? 1 : 0;
+        if (gray.getPixel(x, y).r > threshold) pts.add((x, y));
       }
     }
+    if (pts.length < sw * sh * 0.02) return null;
 
-    // 3) 提取最大的连通亮区域（纸张本体），剔除背景噪声干扰
-    final region = _largestBrightRegion(bin, sw, sh);
-    if (region.length < sw * sh * 0.02) return null;
+    // 4) 质心
+    var cx = 0.0, cy = 0.0;
+    for (final (x, y) in pts) {
+      cx += x; cy += y;
+    }
+    cx /= pts.length; cy /= pts.length;
 
-    // 4) 求凸包
-    final hull = _convexHull(region);
-    if (hull.length < 4) return null;
+    // 5) 相对质心按四象限取最远点，得到 4 个候选角
+    final candidates = <Offset>[];
+    for (var q = 0; q < 4; q++) {
+      var best = const Offset(-1, -1);
+      var bestD = -1.0;
+      final lo = q * 90.0 * 0.0174533, hi = (q + 1) * 90.0 * 0.0174533;
+      for (final (x, y) in pts) {
+        final a = _angle(Offset(x.toDouble(), y.toDouble()), Offset(cx, cy));
+        if (a < lo || a >= hi) continue;
+        final d = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+        if (d > bestD) {
+          bestD = d;
+          best = Offset(x.toDouble(), y.toDouble());
+        }
+      }
+      if (best.dx < 0) return null;
+      candidates.add(best);
+    }
 
-    // 5) 多边形近似（RDP），压出真正的纸张角点
-    final eps = _perimeter(hull) * 0.02;
-    final approx = _rdp(hull, eps);
-
-    // 6) 取面积最大的 4 角四边形
-    final quad = _bestQuad(approx);
-    if (quad == null) return null;
-
-    // 7) 排序 + 面积校验
-    final ordered = _orderCorners(quad);
+    // 6) 校验：四边形面积应占一定比例
+    final ordered = _orderCorners(candidates);
     if (_quadArea(ordered) < sw * sh * 0.06) return null;
 
-    // 8) 放大回原图坐标
+    // 7) 放大回原图坐标
     final scaleX = src.width / sw, scaleY = src.height / sh;
     return ordered.map((p) => Offset(p.dx * scaleX, p.dy * scaleY)).toList();
   }
 
-  /// 最大连通亮区域（BFS），返回亮像素点列表
-  static List<Offset> _largestBrightRegion(List<List<int>> bin, int w, int h) {
-    final visited = List.generate(h, (_) => List<bool>.filled(w, false));
-    var best = <Offset>[];
-    for (var y = 0; y < h; y++) {
-      for (var x = 0; x < w; x++) {
-        if (bin[y][x] == 1 && !visited[y][x]) {
-          final stack = <(int, int)>[(x, y)];
-          visited[y][x] = true;
-          final comp = <Offset>[];
-          while (stack.isNotEmpty) {
-            final (cx, cy) = stack.removeLast();
-            comp.add(Offset(cx.toDouble(), cy.toDouble()));
-            for (final (nx, ny) in _neighbors8(cx, cy, w, h)) {
-              if (!visited[ny][nx] && bin[ny][nx] == 1) {
-                visited[ny][nx] = true;
-                stack.add((nx, ny));
-              }
-            }
-          }
-          if (comp.length > best.length) best = comp;
-        }
-      }
-    }
-    return best;
-  }
-
-  /// Andrew 单调链凸包
-  static List<Offset> _convexHull(List<Offset> pts) {
-    if (pts.length < 3) return pts;
-    final p = [...pts]
-      ..sort((a, b) => a.dx != b.dx ? a.dx.compareTo(b.dx) : a.dy.compareTo(b.dy));
-    List<Offset> build(List<Offset> seq) {
-      final h = <Offset>[];
-      for (final o in seq) {
-        while (h.length >= 2) {
-          final a = h[h.length - 2], b = h[h.length - 1];
-          final cross =
-              (b.dx - a.dx) * (o.dy - a.dy) - (b.dy - a.dy) * (o.dx - a.dx);
-          if (cross <= 0) {
-            h.removeLast();
-          } else {
-            break;
-          }
-        }
-        h.add(o);
-      }
-      return h;
-    }
-    final lower = build(p);
-    final upper = build(p.reversed.toList());
-    lower.removeLast();
-    upper.removeLast();
-    return [...lower, ...upper];
-  }
-
-  /// 多边形周长
-  static double _perimeter(List<Offset> pts) {
-    var sum = 0.0;
-    for (var i = 0; i < pts.length; i++) {
-      sum += (pts[(i + 1) % pts.length] - pts[i]).distance;
-    }
-    return sum;
-  }
-
-  /// Ramer–Douglas–Peucker 多边形简化
-  static List<Offset> _rdp(List<Offset> pts, double eps) {
-    if (pts.length <= 2) return pts;
-    var dmax = 0.0, index = 0;
-    final n = pts.length;
-    for (var i = 1; i < n - 1; i++) {
-      final d = _perpDistSq(pts[i], pts[0], pts[n - 1]);
-      if (d > dmax) {
-        index = i;
-        dmax = d;
-      }
-    }
-    if (dmax > eps * eps) {
-      final left = _rdp(pts.sublist(0, index + 1), eps);
-      final right = _rdp(pts.sublist(index), eps);
-      return [...left.sublist(0, left.length - 1), ...right];
-    }
-    return [pts.first, pts.last];
-  }
-
-  static double _perpDistSq(Offset p, Offset a, Offset b) {
-    final dx = b.dx - a.dx, dy = b.dy - a.dy;
-    final lenSq = dx * dx + dy * dy;
-    if (lenSq == 0) {
-      final qx = p.dx - a.dx, qy = p.dy - a.dy;
-      return qx * qx + qy * qy;
-    }
-    final t = ((p.dx - a.dx) * dx + (p.dy - a.dy) * dy) / lenSq;
-    final tc = t.clamp(0.0, 1.0).toDouble();
-    final qx = a.dx + tc * dx, qy = a.dy + tc * dy;
-    final ux = p.dx - qx, uy = p.dy - qy;
-    return ux * ux + uy * uy;
-  }
-
-  /// 从近似顶点中取面积最大的 4 角四边形
-  static List<Offset>? _bestQuad(List<Offset> pts) {
-    if (pts.length < 4) return null;
-    if (pts.length == 4) return pts;
-    List<Offset>? best;
-    var bestArea = -1.0;
-    void comb(int start, List<Offset> cur) {
-      if (cur.length == 4) {
-        final a = _quadArea(cur);
-        if (a > bestArea) {
-          bestArea = a;
-          best = List.of(cur);
-        }
-        return;
-      }
-      for (var i = start; i < pts.length; i++) {
-        cur.add(pts[i]);
-        comb(i + 1, cur);
-        cur.removeLast();
-      }
-    }
-    comb(0, []);
-    return best;
+  static double _angle(Offset p, Offset c) {
+    final a = (p - c).direction;
+    return a < 0 ? a + 6.283185 : a;
   }
 
   /// 排序为 左上、右上、右下、左下

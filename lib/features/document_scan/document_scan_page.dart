@@ -40,24 +40,11 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
       final corners = ImageService.detectDocumentCorners(src);
       if (corners != null) {
         out = ImageService.perspectiveCorrect(src, corners);
-        // 检测到纸张：校正 + 强增强（白纸黑字）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.02,
-          contrast: 1.15,
-          saturation: 0.95,
-          sharpen: 0.5,
-        );
-      } else {
-        // 未检测到纸张：温和增强兜底，避免原图灰暗/带背景（不做过曝的强增强）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.01,
-          contrast: 1.08,
-          saturation: 0.95,
-          sharpen: 0.3,
-        );
       }
+      // 自适应曝光归一化：无论四角是否检出都执行，把纸面亮度稳定拉到固定白点，
+      // 从根上消除"有时过曝发白、有时欠曝发灰、效果不稳定"。再补一点边缘锐化。
+      out = ImageService.normalizeForScan(out);
+      out = ImageService.enhance(out, sharpen: 0.35);
       return await ImageService.savePng(out, name: 'enhanced');
     } catch (_) {
       return file;

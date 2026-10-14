@@ -93,24 +93,10 @@ class _TableRecognizePageState extends State<TableRecognizePage> {
       final corners = ImageService.detectDocumentCorners(src);
       if (corners != null) {
         out = ImageService.perspectiveCorrect(src, corners);
-        // 检测到纸张：校正 + 强增强（白纸黑字）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.02,
-          contrast: 1.15,
-          saturation: 0.95,
-          sharpen: 0.5,
-        );
-      } else {
-        // 未检测到纸张：温和增强兜底，避免原图灰暗/带背景（不做过曝的强增强）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.01,
-          contrast: 1.08,
-          saturation: 0.95,
-          sharpen: 0.3,
-        );
       }
+      // 自适应曝光归一化：无论四角是否检出都执行，稳定纸面亮度，消除忽明忽暗
+      out = ImageService.normalizeForScan(out);
+      out = ImageService.enhance(out, sharpen: 0.4);
       return await ImageService.savePng(out, name: 'enhanced');
     } catch (_) {
       return file;

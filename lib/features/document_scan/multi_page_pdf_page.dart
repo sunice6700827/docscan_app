@@ -31,24 +31,10 @@ class _MultiPagePdfPageState extends State<MultiPagePdfPage> {
       final corners = ImageService.detectDocumentCorners(decoded);
       if (corners != null) {
         out = ImageService.perspectiveCorrect(decoded, corners);
-        // 检测到纸张：校正 + 强增强（白纸黑字）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.02,
-          contrast: 1.15,
-          saturation: 0.95,
-          sharpen: 0.5,
-        );
-      } else {
-        // 未检测到纸张：温和增强兜底，避免原图灰暗/带背景（不做过曝的强增强）
-        out = ImageService.enhance(
-          out,
-          brightness: 0.01,
-          contrast: 1.08,
-          saturation: 0.95,
-          sharpen: 0.3,
-        );
       }
+      // 自适应曝光归一化：每页都执行，连续拍摄时页与页之间明暗也保持一致
+      out = ImageService.normalizeForScan(out);
+      out = ImageService.enhance(out, sharpen: 0.35);
       return await ImageService.savePng(out, name: 'page');
     } catch (_) {
       return file;
