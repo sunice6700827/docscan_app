@@ -39,14 +39,15 @@ class _DocumentScanPageState extends State<DocumentScanPage> {
       final corners = ImageService.detectDocumentCorners(src);
       if (corners != null) {
         out = ImageService.perspectiveCorrect(src, corners);
+        // 检测到纸张才增强（只处理纸面），避免对含背景/阴影的原图增强导致曝光
+        out = ImageService.enhance(
+          out,
+          brightness: 0.02,
+          contrast: 1.15,
+          saturation: 0.95,
+          sharpen: 0.5,
+        );
       }
-      out = ImageService.enhance(
-        out,
-        brightness: 0.02,
-        contrast: 1.15,
-        saturation: 0.95,
-        sharpen: 0.5,
-      );
       return await ImageService.savePng(out, name: 'enhanced');
     } catch (_) {
       return file;
