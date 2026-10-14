@@ -44,7 +44,14 @@ List<List<String>> structureTable(OcrDocument doc) {
     for (final l in row) {
       allElements.addAll(l.elements);
     }
-    if (allElements.isEmpty) continue;
+    if (allElements.isEmpty) {
+      // 兜底：HOCR 不可用（纯文本识别结果无词坐标）时，每行文本作为单格
+      for (final l in row) {
+        final t = l.text.trim();
+        if (t.isNotEmpty) table.add([t]);
+      }
+      continue;
+    }
     allElements.sort((a, b) => a.box.left.compareTo(b.box.left));
 
     final cellGap = math.max(8.0, _estimateElementWidth(allElements) * 0.6);

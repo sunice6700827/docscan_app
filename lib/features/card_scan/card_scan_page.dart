@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' show Offset, Size, Rect;
 
 import 'package:flutter/material.dart';
@@ -19,19 +20,40 @@ class _CardScanPageState extends State<CardScanPage> {
   File? _imageFile;
   Size? _imageSize; // 原始图片尺寸
   List<Offset>? _corners; // 屏幕显示坐标的 4 个角点（TL,TR,BR,BL）
+  List<Offset>? _autoCornersPx; // 自动检测到的角点（图片像素坐标）
   Rect? _editRect; // 编辑时图片显示区域（供矫正换算像素坐标）
   bool _busy = false;
 
   static const _cornerColor = Color(0xFF2F6BFF);
 
-  Future<void> _pick() async {
-    final file = await PickHelper.pickFromGallery();
+  Future<void> _pick({required bool camera}) async {
+    final file = camera ? await PickHelper.takePhoto() : await PickHelper.pickFromGallery();
     if (file == null || !mounted) return;
-    final decoded = ImageService.decode(file);
+    setState(() => _busy = true);
+    List<Offset>? auto;
+    Size? size;
+    try {
+      final decoded = ImageService.decode(file);
+      size = Size(decoded.width.toDouble(), decoded.height.toDouble());
+      // 自动检测卡片四角：成功则角点直接落在证件上，失败退回内缩框由用户拖动
+      auto = ImageService.detectDocumentCorners(decoded);
+    } catch (_) {
+      auto = null;
+    }
+    if (!mounted) return;
+    if (size == null) {
+      setState(() => _busy = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('图片读取失败，请换一张照片')),
+      );
+      return;
+    }
     setState(() {
       _imageFile = file;
-      _imageSize = Size(decoded.width.toDouble(), decoded.height.toDouble());
+      _imageSize = size;
+      _autoCornersPx = auto;
       _corners = null;
+      _busy = false;
     });
   }
 
@@ -55,7 +77,9 @@ class _CardScanPageState extends State<CardScanPage> {
     setState(() => _busy = true);
     try {
       final decoded = ImageService.decode(_imageFile!);
-      final corrected = ImageService.perspectiveCorrect(decoded, cornersPx);
+      var corrected = ImageService.perspectiveCorrect(decoded, cornersPx);
+      // 自适应曝光归一化：压掉手影/环境灰底，证件底色干净、字迹清晰
+      corrected = ImageService.normalizeForScan(corrected);
       final file = await ImageService.savePng(corrected, name: 'card');
       if (!mounted) return;
       Navigator.of(context).push(
@@ -76,7 +100,9 @@ class _CardScanPageState extends State<CardScanPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('证件扫描')),
-      body: _imageFile == null ? _buildEmpty() : _buildEditor(),
+      body: _busy
+          ? const Center(child: CircularProgressIndicator())
+          : (_imageFile == null ? _buildEmpty() : _buildEditor()),
     );
   }
 
@@ -97,17 +123,28 @@ class _CardScanPageState extends State<CardScanPage> {
               child: const Icon(Icons.badge_outlined, color: Color(0xFFFF8A00), size: 44),
             ),
             const SizedBox(height: 20),
-            const Text('选择一张证件或卡片照片',
+            const Text('拍摄或选择一张证件或卡片照片',
                 style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
-            const Text('拖动四个角点对齐证件边缘，自动矫正为正面视图并保存',
+            const Text('自动检测证件四角，也可拖动角点对齐边缘，矫正为正面视图并保存',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 13, color: Color(0xFF8A9099))),
             const SizedBox(height: 28),
-            FilledButton.icon(
-              onPressed: _pick,
-              icon: const Icon(Icons.photo_library_outlined),
-              label: const Text('从相册选择'),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: () => _pick(camera: true),
+                  icon: const Icon(Icons.photo_camera_outlined),
+                  label: const Text('拍照'),
+                ),
+                const SizedBox(width: 16),
+                FilledButton.icon(
+                  onPressed: () => _pick(camera: false),
+                  icon: const Icon(Icons.photo_library_outlined),
+                  label: const Text('从相册选择'),
+                ),
+              ],
             ),
           ],
         ),
@@ -140,12 +177,29 @@ class _CardScanPageState extends State<CardScanPage> {
                     _editRect = rect;
                     final corners = _corners ??
                         (() {
-                          final c = [
-                            rect.topLeft,
-                            rect.topRight,
-                            rect.bottomRight,
-                            rect.bottomLeft,
-                          ];
+                          // 优先使用自动检测的角点（像素坐标换算到显示坐标）
+                          final auto = _autoCornersPx;
+                          List<Offset> c;
+                          if (auto != null && auto.length == 4) {
+                            final s = rect.width / _imageSize!.width;
+                            c = auto
+                                .map((p) => Offset(
+                                      (p.dx * s).clamp(0.0, rect.width) + rect.left,
+                                      (p.dy * s).clamp(0.0, rect.height) + rect.top,
+                                    ))
+                                .toList();
+                          } else {
+                            // 检测失败：内缩 8% 作为初始框，避免贴满全屏
+                            final ix = rect.width * 0.08;
+                            final iy = rect.height * 0.08;
+                            final inner = rect.deflate(math.min(ix, iy));
+                            c = [
+                              inner.topLeft,
+                              inner.topRight,
+                              inner.bottomRight,
+                              inner.bottomLeft,
+                            ];
+                          }
                           WidgetsBinding.instance.addPostFrameCallback((_) {
                             if (mounted) setState(() => _corners = c);
                           });
@@ -164,10 +218,12 @@ class _CardScanPageState extends State<CardScanPage> {
                             gaplessPlayback: true,
                           ),
                         ),
-                        // 角点连线蒙版
-                        Positioned.fromRect(
-                          rect: rect,
-                          child: CustomPaint(painter: _CornerPainter(corners, _cornerColor)),
+                        // 角点连线蒙版：铺满整个 Stack，与手柄共用同一坐标系，
+                        // 避免在带偏移的子容器内重复叠加 rect 原点导致蓝框错位
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: CustomPaint(painter: _CornerPainter(corners, _cornerColor)),
+                          ),
                         ),
                         for (var i = 0; i < 4; i++)
                           _CornerHandle(
@@ -200,7 +256,7 @@ class _CardScanPageState extends State<CardScanPage> {
               children: [
                 Expanded(
                   child: OutlinedButton.icon(
-                    onPressed: _pick,
+                    onPressed: () => _pick(camera: false),
                     icon: const Icon(Icons.refresh),
                     label: const Text('重选'),
                     style: OutlinedButton.styleFrom(foregroundColor: Colors.white),

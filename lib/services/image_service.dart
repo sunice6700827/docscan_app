@@ -650,8 +650,21 @@ class ImageService {
       p.setRgb(g, g, g);
     }
 
-    // 2) Otsu 阈值二值化
-    final threshold = _otsuThreshold(gray);
+    // 2) Otsu 阈值二值化；失败时（如手持卡片：背景杂乱、主体占比小，
+    // Otsu 容易把背景一起分进来）再用固定亮度阈值重试一次
+    var ordered = _quadFromBinary(gray, sw, sh, _otsuThreshold(gray));
+    if (ordered == null) {
+      ordered = _quadFromBinary(gray, sw, sh, 150);
+    }
+    if (ordered == null) return null;
+
+    // 放大回原图坐标
+    final scaleX = src.width / sw, scaleY = src.height / sh;
+    return ordered.map((p) => Offset(p.dx * scaleX, p.dy * scaleY)).toList();
+  }
+
+  /// 按给定阈值二值化并提取纸张四边形；检测不可靠时返回 null
+  static List<Offset>? _quadFromBinary(img.Image gray, int sw, int sh, int threshold) {
     final bin = List.generate(sh, (_) => List<int>.filled(sw, 0));
     for (var y = 0; y < sh; y++) {
       for (var x = 0; x < sw; x++) {
@@ -659,34 +672,32 @@ class ImageService {
       }
     }
 
-    // 3) 提取最大的连通亮区域（纸张本体），剔除背景噪声干扰
+    // 提取最大的连通亮区域（纸张本体），剔除背景噪声干扰
     final region = _largestBrightRegion(bin, sw, sh);
     if (region.length < sw * sh * 0.02) return null;
 
-    // 4) 求凸包
+    // 求凸包
     final hull = _convexHull(region);
     if (hull.length < 4) return null;
 
-    // 5) 多边形近似（RDP），压出真正的纸张角点
+    // 多边形近似（RDP），压出真正的纸张角点
     final eps = _perimeter(hull) * 0.02;
     final approx = _rdp(hull, eps);
 
-    // 6) 取面积最大的 4 角四边形
+    // 取面积最大的 4 角四边形
     final quad = _bestQuad(approx);
     if (quad == null) return null;
 
-    // 7) 排序 + 面积校验
+    // 排序 + 面积校验
     final ordered = _orderCorners(quad);
     if (_quadArea(ordered) < sw * sh * 0.06) return null;
 
-    // 8) 可靠性校验：特写照片里纸张常超出画面，凸包角点会贴在图像边界上，
+    // 可靠性校验：特写照片里纸张常超出画面，凸包角点会贴在图像边界上，
     // 此时"检出的四边形"其实是画面本身，拿它做透视矫正会把边缘文字裁掉。
     // 判定不可靠返回 null，流程自动跳过矫正、只做曝光归一化（歪斜交给手动四角）。
     if (!_quadReliable(ordered, sw, sh)) return null;
 
-    // 9) 放大回原图坐标
-    final scaleX = src.width / sw, scaleY = src.height / sh;
-    return ordered.map((p) => Offset(p.dx * scaleX, p.dy * scaleY)).toList();
+    return ordered;
   }
 
   /// 四边形角点可靠性：≥2 个角贴着图像边界，或四边形几乎覆盖整幅画面，

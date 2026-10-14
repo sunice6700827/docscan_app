@@ -92,28 +92,45 @@ class OcrService {
   }
 
   /// 解析 HOCR 为行与词坐标
+  ///
+  /// 注意：Tesseract 5 的 title 属性在 bbox 之后还有 `; x_size ...; baseline ...`
+  /// 等附加内容，不能要求 bbox 数字后紧跟闭合引号（旧写法导致永远解析为 0 行，
+  /// 表格识别因此总是提示"换更清晰的照片"）。改为：先匹配行起始标签取行 bbox，
+  /// 再按文本位置把词归属到所在行。
   List<OcrLine> _parseHocr(String hocr) {
     final lines = <OcrLine>[];
-    final lineReg = RegExp(
-      '<span class=[\'"]ocr_line[\'"][^>]*title=[\'"](?:bbox|bbox_padded) ([\\d]+) ([\\d]+) ([\\d]+) ([\\d]+)[\'"][^>]*>([\\s\\S]*?)</span>',
+    final lineStartReg = RegExp(
+      '<span class=[\'"]ocr_line[\'"][^>]*?title=[\'"](?:bbox|bbox_padded)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)',
     );
     final wordReg = RegExp(
-      '<span class=[\'"]ocrx_word[\'"][^>]*title=[\'"]bbox ([\\d]+) ([\\d]+) ([\\d]+) ([\\d]+)[\'"][^>]*>(.*?)</span>',
+      '<span class=[\'"]ocrx_word[\'"][^>]*?title=[\'"]bbox\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)[^\'"]*[\'"][^>]*>(.*?)</span>',
     );
-    for (final m in lineReg.allMatches(hocr)) {
+
+    final lineMatches = lineStartReg.allMatches(hocr).toList();
+    if (lineMatches.isEmpty) return lines;
+    final wordMatches = wordReg.allMatches(hocr).toList();
+
+    var wi = 0; // 词按文档顺序排列，行也按顺序，单遍线性扫描即可归属
+    for (var li = 0; li < lineMatches.length; li++) {
+      final m = lineMatches[li];
+      final lineStart = m.start;
+      final lineEnd = li + 1 < lineMatches.length ? lineMatches[li + 1].start : hocr.length;
       final x1 = int.parse(m.group(1)!);
       final y1 = int.parse(m.group(2)!);
       final x2 = int.parse(m.group(3)!);
       final y2 = int.parse(m.group(4)!);
-      final inner = m.group(5)!;
       final elements = <OcrElement>[];
       final textBuf = StringBuffer();
-      for (final w in wordReg.allMatches(inner)) {
+      while (wi < wordMatches.length && wordMatches[wi].start < lineEnd) {
+        final w = wordMatches[wi];
+        wi++;
+        if (w.start <= lineStart) continue;
         final wx1 = int.parse(w.group(1)!);
         final wy1 = int.parse(w.group(2)!);
         final wx2 = int.parse(w.group(3)!);
         final wy2 = int.parse(w.group(4)!);
-        final t = _unescape(w.group(5)!);
+        final t = _unescape(_innerText(w.group(5)!));
+        if (t.isEmpty) continue;
         elements.add(OcrElement(
           text: t,
           box: Rect.fromLTRB(wx1.toDouble(), wy1.toDouble(), wx2.toDouble(), wy2.toDouble()),
@@ -121,8 +138,9 @@ class OcrService {
         if (textBuf.isNotEmpty) textBuf.write(' ');
         textBuf.write(t);
       }
+      if (elements.isEmpty) continue;
       lines.add(OcrLine(
-        text: textBuf.isEmpty ? _innerText(inner) : textBuf.toString(),
+        text: textBuf.toString(),
         box: Rect.fromLTRB(x1.toDouble(), y1.toDouble(), x2.toDouble(), y2.toDouble()),
         elements: elements,
       ));
