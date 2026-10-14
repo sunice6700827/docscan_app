@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' show Offset, Rect;
 
 import 'package:image/image.dart' as img;
@@ -68,6 +69,35 @@ class ImageService {
     );
   }
 
+  /// 处理前缩图（线性插值，快）：相机原图常为 4000+ 宽，处理前缩到最长边
+  /// maxSide 可大幅降低后续逐像素处理耗时，同时保持足够清晰度
+  static img.Image downscaleForProcessing(img.Image src, {int maxSide = 2400}) {
+    if (src.width <= maxSide && src.height <= maxSide) return src;
+    final scale = maxSide / (src.width > src.height ? src.width : src.height);
+    return img.copyResize(
+      src,
+      width: (src.width * scale).round(),
+      height: (src.height * scale).round(),
+      interpolation: img.Interpolation.linear,
+    );
+  }
+
+  /// 把图像像素一次性读入 RGB 数组（getPixel 很慢，读数组快 5~10 倍）
+  static Uint8List _toRgb(img.Image src) {
+    final w = src.width, h = src.height;
+    final buf = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final p = src.getPixel(x, y);
+        buf[i++] = p.r.toInt();
+        buf[i++] = p.g.toInt();
+        buf[i++] = p.b.toInt();
+      }
+    }
+    return buf;
+  }
+
   /// 矩形裁剪
   static img.Image crop(img.Image src, Rect box) {
     final x = box.left.round().clamp(0, src.width - 1);
@@ -109,6 +139,8 @@ class ImageService {
       srcTL: tl, srcTR: tr, srcBR: br, srcBL: bl,
     );
 
+    final buf = _toRgb(src);
+    final sw = src.width, sh = src.height;
     final out = img.Image(width: outWidth.round(), height: h.round());
     for (var y = 0; y < out.height; y++) {
       for (var x = 0; x < out.width; x++) {
@@ -118,7 +150,7 @@ class ImageService {
         final inv = w == 0 ? 0.0 : 1.0 / w;
         final u = sx * inv;
         final v = sy * inv;
-        final s = _sample(src, u, v);
+        final s = _sampleBuf(buf, sw, sh, u, v);
         out.setPixelRgb(x, y, s[0], s[1], s[2]);
       }
     }
@@ -196,24 +228,24 @@ class ImageService {
     return List.generate(n, (i) => m[i][n]);
   }
 
-  /// 双线性采样（越界返回最近有效像素）
-  static List<int> _sample(img.Image src, double u, double v) {
-    var x0 = u.floor().clamp(0, src.width - 1);
-    var y0 = v.floor().clamp(0, src.height - 1);
-    var x1 = (x0 + 1).clamp(0, src.width - 1);
-    var y1 = (y0 + 1).clamp(0, src.height - 1);
+  /// 双线性采样（基于 RGB 数组，越界返回最近有效像素）
+  static List<int> _sampleBuf(Uint8List buf, int w, int h, double u, double v) {
+    var x0 = u.floor().clamp(0, w - 1).toInt();
+    var y0 = v.floor().clamp(0, h - 1).toInt();
+    var x1 = (x0 + 1).clamp(0, w - 1).toInt();
+    var y1 = (y0 + 1).clamp(0, h - 1).toInt();
     final fx = u - u.floor();
     final fy = v - v.floor();
 
-    final p00 = src.getPixel(x0, y0);
-    final p10 = src.getPixel(x1, y0);
-    final p01 = src.getPixel(x0, y1);
-    final p11 = src.getPixel(x1, y1);
+    final i00 = (y0 * w + x0) * 3;
+    final i10 = (y0 * w + x1) * 3;
+    final i01 = (y1 * w + x0) * 3;
+    final i11 = (y1 * w + x1) * 3;
 
     int lerp(num a, num b, num t) => (a + (b - a) * t).round().clamp(0, 255);
-    final r = lerp(lerp(p00.r, p10.r, fx), lerp(p01.r, p11.r, fx), fy);
-    final g = lerp(lerp(p00.g, p10.g, fx), lerp(p01.g, p11.g, fx), fy);
-    final bl = lerp(lerp(p00.b, p10.b, fx), lerp(p01.b, p11.b, fx), fy);
+    final r = lerp(lerp(buf[i00], buf[i10], fx), lerp(buf[i01], buf[i11], fx), fy);
+    final g = lerp(lerp(buf[i00 + 1], buf[i10 + 1], fx), lerp(buf[i01 + 1], buf[i11 + 1], fx), fy);
+    final bl = lerp(lerp(buf[i00 + 2], buf[i10 + 2], fx), lerp(buf[i01 + 2], buf[i11 + 2], fx), fy);
     return [r, g, bl];
   }
 
@@ -269,8 +301,9 @@ class ImageService {
       [-1, 5, 0],
       [0, 0, 0],
     ];
-    final out = img.Image.from(src);
+    final buf = _toRgb(src);
     final w = src.width, h = src.height;
+    final out = img.Image.from(src);
     for (var y = 0; y < h; y++) {
       for (var x = 0; x < w; x++) {
         var r = 0.0, g = 0.0, b = 0.0;
@@ -279,14 +312,15 @@ class ImageService {
             final px = (x + kx - 1).clamp(0, w - 1);
             final py = (y + ky - 1).clamp(0, h - 1);
             final k = kernel[ky][kx];
-            final p = src.getPixel(px, py);
-            r += p.r * k; g += p.g * k; b += p.b * k;
+            final i = (py * w + px) * 3;
+            r += buf[i] * k; g += buf[i + 1] * k; b += buf[i + 2] * k;
           }
         }
-        final p0 = src.getPixel(x, y);
-        final nr = p0.r + (r - p0.r) * amount;
-        final ng = p0.g + (g - p0.g) * amount;
-        final nb = p0.b + (b - p0.b) * amount;
+        final i = (y * w + x) * 3;
+        final p0r = buf[i], p0g = buf[i + 1], p0b = buf[i + 2];
+        final nr = p0r + (r - p0r) * amount;
+        final ng = p0g + (g - p0g) * amount;
+        final nb = p0b + (b - p0b) * amount;
         out.setPixelRgb(x, y, nr.round().clamp(0, 255), ng.round().clamp(0, 255), nb.round().clamp(0, 255));
       }
     }

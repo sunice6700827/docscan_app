@@ -87,7 +87,8 @@ class _TableRecognizePageState extends State<TableRecognizePage> {
   /// 拍照/选图后自动处理：透视校正 + 轻度增强
   Future<File> _autoProcess(File file) async {
     try {
-      final src = ImageService.decode(file);
+      var src = ImageService.decode(file);
+      src = ImageService.downscaleForProcessing(src); // 缩到2400宽，显著提速，清晰度足够
       var out = src;
       final corners = ImageService.detectDocumentCorners(src);
       if (corners != null) {

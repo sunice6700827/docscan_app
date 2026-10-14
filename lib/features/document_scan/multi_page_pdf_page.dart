@@ -25,7 +25,8 @@ class _MultiPagePdfPageState extends State<MultiPagePdfPage> {
   /// 拍摄/选图后自动透视校正 + 增强：检测到可靠文档四角则矫正并提亮增强，否则保留原图
   Future<File> _autoCorrect(File file) async {
     try {
-      final decoded = ImageService.decode(file);
+      var decoded = ImageService.decode(file);
+      decoded = ImageService.downscaleForProcessing(decoded); // 缩到2400宽，显著提速，清晰度足够
       var out = decoded;
       final corners = ImageService.detectDocumentCorners(decoded);
       if (corners != null) {
